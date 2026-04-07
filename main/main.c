@@ -24,10 +24,10 @@
 
 #include "esp_camera.h"
 #include "config.h"
+#include "types.h"
 
 
 // macros
-
 #define MAXIMUM_RETRY  5 // deshabilitado en el handler
 #define TIMER_TIME_PREDETERMINADO 30000000 // tiempo en us
 
@@ -92,9 +92,6 @@
 #define PCLK_GPIO_NUM     22
 
 
-
-
-
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
@@ -104,36 +101,7 @@
 #define BIT_CONEXION BIT0
 #define BIT_DESCONEXION BIT1
 
-// tipos
-typedef enum {
-    PING,
-    PONG,
-    TEXTO,
-    IMAGEN,
-    COMANDO,
-} tTipo;
 
-typedef enum {
-    FLASH,
-    FOTO,
-    TIEMPO_FOTO,
-} tTiposComandos;
-
-typedef struct {
-    int dispositivo;
-    tTiposComandos comando;
-    int parametro;
-} tComando;
-
-typedef struct {
-    tTipo tipo; // tipo de mensaje: ping, texto, imagen...
-    uint32_t size; // tamanio del mensaje
-} tCabecera;
-
-typedef struct tNodo {
-    tCabecera cabecera;
-    void* body; // CRITICO: LIBERAR BODY AL EXTRAER 
-} tNodo; // para un comportamiento correcto, body debe de ser dinamico
 
 // variables globales
 const char* TAG = "firmwareESP32cam";
@@ -141,8 +109,8 @@ static EventGroupHandle_t s_wifi_event_group, connection_event_group_handle;
 static esp_netif_t* sta_netif = NULL;
 static int s_retry_num = 0;
 static int server_socket = -1;
-static int flash_time = 1000;
-static int flash_mode = 0; // TODO: race condition entre execute (escritura) y capture (lectura)
+static volatile int flash_time = 1000;
+static volatile int flash_mode = 0; // TODO: race condition entre execute (escritura) y capture (lectura)
 static TaskHandle_t heartbeat_ping_handle, execution_thread_handle, send_thread_handle, receive_thread_handle, connection_thread_handle, capture_thread_handle;
 static QueueHandle_t send_queue, receive_queue;
 static esp_timer_handle_t timer;

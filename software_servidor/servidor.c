@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -20,6 +21,7 @@
 #define HEARTBEAT_TIME 5
 #define TIMEOUT_TIME 15
 #define MAX_SOCKETS 10
+#define MAX_NOMBRE_CARPETA 16
 
 /*
 Servidor que maneja peticiones HTTP que se realizan desde una ESP32cam
@@ -44,7 +46,7 @@ void *command_thread(void* arg);
 void handler(int sig);
 int leer_comando(tComando *com);
 int enviar_nodo(int socket_cliente, tNodo* n, int size_cabecera, int size_body);
-int guardar_imagen(uint8_t* img, uint32_t size);
+int guardar_imagen(uint8_t* img, uint32_t size, int id);
 
 
 
@@ -120,6 +122,7 @@ int main(void) {
         int i = 0;
         while (i < MAX_SOCKETS) {
             if (dispositivo[i].client_socket == -1) {
+                dispositivo[i].id = i;
                 dispositivo[i].client_socket = aux_client_socket;
                 dispositivo[i].client_addr = aux_client_addr;
                 dispositivo[i].client_len = aux_client_len;
@@ -128,10 +131,21 @@ int main(void) {
                 printf("Conexion establecida con: %s\n", dispositivo[i].ip_cliente);
                 cola_init(&dispositivo[i].cola_recieve);
                 cola_init(&dispositivo[i].cola_send);
+                char nombre_carpeta[MAX_NOMBRE_CARPETA];
+                snprintf(nombre_carpeta, MAX_NOMBRE_CARPETA, "img%d", dispositivo[i].id);
+                if (mkdir(nombre_carpeta, 0755) == -1) {
+                    if (errno == EEXIST) { // la carpeta existe
+                        
+                    }
+                    else {
+                        perror("main: mkdir, error al crear la carpeta");
+                        return 1;
+                    }
+                }
                 // tDispositivo* d = malloc(sizeof(tDispositivo));
                 // *d = dispositivo[i]; // la cola se comparte entre todos!
 
-
+                // TODO: merece la pena estar creando y destruyendo threads cada vez que se conecta un dispositivo nuevo?
                 if (pthread_create(&dispositivo[i].thread_ping, NULL, heartbeat_ping, (void*) &dispositivo[i]) != 0) {
                     perror("Error al crear hilo ping");
                     return 1;
@@ -158,6 +172,7 @@ int main(void) {
         }
         if (i == MAX_SOCKETS) {
             printf("No se aceptan mas conexiones, maximo de dispositivos alcanzado\n");
+            close(aux_client_socket);
         }
     }
 
@@ -292,7 +307,7 @@ void *execution_thread(void* arg) {
                 break;
             case IMAGEN: // TODO: no se guarda la imagen
                 printf("Imagen recibida, procesando...\n");
-                guardar_imagen((uint8_t*) nodo->body, nodo->cabecera.size);
+                guardar_imagen((uint8_t*) nodo->body, nodo->cabecera.size, d->id);
                 break;
             case TEXTO:
                 printf("Mensaje Servidor: %s\n", (char*) nodo->body);
@@ -445,14 +460,14 @@ int leer_comando(tComando *com) {
     return 0;
 }
 
-// debe de existir la carpeta img
-int guardar_imagen(uint8_t* img, uint32_t size) {
+// debe de existir la carpeta img(n dispositivo)
+int guardar_imagen(uint8_t* img, uint32_t size, int id) {
     char name[NAME_BUFFER_SIZE];
     time_t t = time(NULL);
     struct tm* st_tiempo = localtime(&t);
     char tiempo[80];
     strftime(tiempo, 80, "%H-%M-%S_%Y-%m-%d", st_tiempo);
-    snprintf(name, NAME_BUFFER_SIZE, "img/img_%s_%d.jpg", tiempo, 0); // TODO: poner dispositivo
+    snprintf(name, NAME_BUFFER_SIZE, "img%d/img_%s.jpg", id, tiempo); // TODO: poner dispositivo
 
     int fd = open(name, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd == -1) {
