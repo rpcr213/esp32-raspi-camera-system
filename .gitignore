@@ -1,0 +1,13 @@
+# carpetas
+build/
+components/
+managed_components/
+z_otros/
+.vscode/
+software_servidor/img/
+
+# archivos
+main/config.h
+software_servidor/comandos_relevantes.txt
+software_servidor/servidor_old.c
+sdkconfig.old
