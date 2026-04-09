@@ -22,6 +22,7 @@
 #define TIMEOUT_TIME 15
 #define MAX_SOCKETS 10
 #define MAX_NOMBRE_CARPETA 16
+#define MAX_HISTORIAL_DISPOSITIVOS 30
 
 /*
 Servidor que maneja peticiones HTTP que se realizan desde una ESP32cam
@@ -52,6 +53,7 @@ int guardar_imagen(uint8_t* img, uint32_t size, int id);
 
 int main(void) {
     printf("Iniciando Servidor...\n");
+    tIP ip[MAX_HISTORIAL_DISPOSITIVOS];
     pthread_t thread_destructor, thread_command;
     pthread_mutex_init(&destructor_mutex, NULL);
     pthread_cond_init(&destructor_c, NULL);
@@ -60,6 +62,10 @@ int main(void) {
         dispositivo[i].id = i;
         dispositivo[i].client_socket = -1; // marcamos cada socket como no inicializado
         dispositivo[i].client_len = sizeof(dispositivo[i].client_addr); // sus...
+    }
+    for (int i = 0; i < MAX_HISTORIAL_DISPOSITIVOS; i++) {
+        ip[i].id = -1;
+        ip[i].tiempo = -1; 
     }
     struct sockaddr_in recieve_socket_addr;
     struct timeval tv = {
@@ -113,7 +119,23 @@ int main(void) {
         struct sockaddr_in aux_client_addr;
         socklen_t aux_client_len = sizeof(aux_client_addr);
         int aux_client_socket = accept(recieve_socket_fd, (struct sockaddr*)&aux_client_addr, &aux_client_len);
-        
+        // almacenamos la ip del cliente
+        char ip_cliente[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(aux_client_addr.sin_addr), ip_cliente, INET_ADDRSTRLEN);
+        // verificamos en el historial
+        int existe = 0;
+        for (int i = 0; i < MAX_HISTORIAL_DISPOSITIVOS; i++) {
+            if (strcmp(ip_cliente, ip[i].ip_addr) == 0) {
+                existe = 1;
+                break;
+            }
+        }
+        if (existe) { // es una reconexion
+            // TODO: meter pausa o algo, es una reconexion
+            sleep(3);
+        }
+
+
         if (aux_client_socket < 0) {
             perror("Accept - aux_client_socket");
             return 1;
@@ -126,11 +148,40 @@ int main(void) {
                 dispositivo[i].client_socket = aux_client_socket;
                 dispositivo[i].client_addr = aux_client_addr;
                 dispositivo[i].client_len = aux_client_len;
-                inet_ntop(AF_INET, &(dispositivo[i].client_addr.sin_addr), dispositivo[i].ip_cliente, INET_ADDRSTRLEN);
+                snprintf(dispositivo[i].ip_cliente, INET_ADDRSTRLEN, "%s", ip_cliente);
                 setsockopt(dispositivo[i].client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 printf("Conexion establecida con: %s\n", dispositivo[i].ip_cliente);
                 cola_init(&dispositivo[i].cola_recieve);
                 cola_init(&dispositivo[i].cola_send);
+                int max = -1, idx = -1, encontrado = 0; // en principio no deberia de haber problemas con idx valiendo -1, siempre habra algun dispositivo que sea mas viejo que otro
+                for (int j = 0; j < MAX_HISTORIAL_DISPOSITIVOS; j++) {
+                    if (ip[j].tiempo == -1) {
+                        ip[j].tiempo = 0;
+                        ip[j].id = i; // le asignamos el dispositivo
+                        snprintf(ip[j].ip_addr, INET_ADDRSTRLEN, "%s", dispositivo[i].ip_cliente); // copiamos la ip al historial
+                        encontrado = 1;
+                        break;
+                    }
+                    else { // si entra aqui es que ya se asigno en algun momento un dispositivo
+                        if (dispositivo[ip[j].id].client_socket == -1) { // el dispositivo no esta conectado
+                            ip[j].tiempo++;
+                            if (max < ip[j].tiempo) {
+                                max = ip[j].tiempo;
+                                idx = j;
+                            }
+                        }
+                    }
+                }
+                if (!encontrado) {
+                    if (idx == -1) {
+                        printf("Error inesperado, todos los dispositivos son igual de viejos? Esta todo lleno?\n");
+                        return 1;
+                    }
+                    else {
+                        ip[idx].tiempo = 0;
+                        snprintf(ip[idx].ip_addr, IPV4_LEN, "%s", dispositivo[i].ip_cliente);
+                    }
+                }
                 char nombre_carpeta[MAX_NOMBRE_CARPETA];
                 snprintf(nombre_carpeta, MAX_NOMBRE_CARPETA, "img%d", dispositivo[i].id);
                 if (mkdir(nombre_carpeta, 0755) == -1) {

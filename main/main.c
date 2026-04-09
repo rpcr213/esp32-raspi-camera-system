@@ -503,9 +503,8 @@ void connection_thread(void* args) {
         EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_DESCONEXION, pdTRUE, pdTRUE, portMAX_DELAY);
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // espera WiFi
         while (init_sockets()) {
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(3000)); // TODO: quizas esta sincrinizacion con la aceptacion del socket esta rota
         }
-        // vTaskDelay(pdMS_TO_TICKS(1000));
         xEventGroupSetBits(connection_event_group_handle, BIT_CONEXION);
     }
 }

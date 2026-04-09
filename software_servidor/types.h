@@ -4,6 +4,8 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 
+#define IPV4_LEN 16
+
 typedef enum {
     PING,
     PONG,
@@ -44,6 +46,11 @@ typedef struct {
     pthread_cond_t cond;
 } tCola;
 
+typedef struct {
+    int id; // el id del dispositivo
+    char ip_addr[INET_ADDRSTRLEN];
+    int tiempo; // la tIP con mas tiempo sera sustituida, -1 es que no se esta usando ese addr
+} tIP;
 
 
 typedef struct {
