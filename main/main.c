@@ -26,6 +26,14 @@
 #include "config.h"
 #include "types.h"
 
+/*
+Buscar cosas por hacer: TODO
+Buscar cosas de las que no estoy seguro: ALERTA
+
+
+
+TOCTOU race
+*/
 
 // macros
 /* esta macro se encarga de notificar el error por la ESP y al servidor */
@@ -104,6 +112,7 @@
 #define FLASH_PIN 4
 #define HEARTBEAT_TIME 5
 #define TIMEOUT_TIME 15
+#define CHECK_CONNECTION_TIME 1000
 #define BIT_CONEXION BIT0
 #define BIT_DESCONEXION BIT1
 
@@ -120,6 +129,7 @@ static volatile int flash_mode = 0; // TODO: race condition entre execute (escri
 static TaskHandle_t heartbeat_ping_handle, execution_thread_handle, send_thread_handle, receive_thread_handle, connection_thread_handle, capture_thread_handle;
 static QueueHandle_t send_queue, receive_queue;
 static esp_timer_handle_t timer;
+static SemaphoreHandle_t server_socket_m;
 
 
 // cabeceras funciones
@@ -147,6 +157,7 @@ void informar_error(char* msj);
 
 
 void app_main(void) {
+    server_socket_m = xSemaphoreCreateMutex();
     connection_event_group_handle = xEventGroupCreate();
     send_queue = xQueueCreate(10, sizeof(tNodo));
     receive_queue = xQueueCreate(10, sizeof(tNodo));
@@ -242,14 +253,6 @@ void init_gpio(void) {
 }
 
 int init_sockets(void) {
-    if (server_socket >= 0) {
-        close(server_socket);
-    }
-    server_socket = socket(AF_INET, SOCK_STREAM, 0); // IPv4 + TPC
-    if (server_socket < 0) {
-        ESP_LOGE(TAG, "ERROR AL CREAT SOCKET: socket()");
-        return 1;
-    }
     struct sockaddr_in server_socket_addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = inet_addr(SERVER_IP),
@@ -259,19 +262,38 @@ int init_sockets(void) {
         .tv_sec = TIMEOUT_TIME, // segundos
         .tv_usec = 0 // microsegundos
     };
+
+
+    xSemaphoreTake(server_socket_m, portMAX_DELAY);
+    if (server_socket >= 0) {
+        close(server_socket);
+    }
+    server_socket = socket(AF_INET, SOCK_STREAM, 0); // IPv4 + TPC
+    if (server_socket < 0) {
+        xSemaphoreGive(server_socket_m);
+        ESP_LOGE(TAG, "ERROR AL CREAT SOCKET: socket()");
+        return 1;
+    }
     if (setsockopt(server_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) {
+        close(server_socket);
+        xSemaphoreGive(server_socket_m);
         ESP_LOGE(TAG, "init_sockets: setsockopt tv");
         return 1;
     } // introducimos un timeout de TIMEOUT_TIME
     int flag = 1;
     if (setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag))) {
+        close(server_socket);
+        xSemaphoreGive(server_socket_m);
         ESP_LOGE(TAG, "init_sockets: setsockopt nagle");
         return 1;
     } // desactivamos el algoritmo de nagle, hacia mas lento el envio de fotos
     if (connect(server_socket, (struct sockaddr*)&server_socket_addr, sizeof(server_socket_addr)) < 0) {
+        close(server_socket);
+        xSemaphoreGive(server_socket_m);
         ESP_LOGE(TAG, "ERROR AL CONECTAR SOCKET: connect()");
         return 1;
     }
+    xSemaphoreGive(server_socket_m);
     return 0;
 }
 
@@ -401,7 +423,7 @@ void execution_thread(void* args) {
     while (1) {
         EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
         tNodo nodo;
-        if (xQueueReceive(receive_queue, &nodo, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        if (xQueueReceive(receive_queue, &nodo, pdMS_TO_TICKS(CHECK_CONNECTION_TIME)) != pdTRUE) { // comprobamos cada segundo que seguimos teniendo conexion
             continue;
         }
         switch (nodo.cabecera.tipo) {
@@ -445,12 +467,15 @@ void send_thread(void* args) {
     while (1) {
         EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
         tNodo nodo;
-        xQueueReceive(send_queue, &nodo, portMAX_DELAY);
+        if (xQueueReceive(send_queue, &nodo, pdMS_TO_TICKS(CHECK_CONNECTION_TIME)) != pdTRUE) {
+            continue;
+        }
         int64_t t10 = esp_timer_get_time();// BORRAR
         if (enviar_nodo(server_socket, &nodo, sizeof(tCabecera), nodo.cabecera.size)) {
             xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
             xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
             ESP_LOGE(TAG, "send_thread: error de conexion, descartando nodo");
+            continue;
         }
         int64_t t1f = esp_timer_get_time();// BORRAR
         ESP_LOGI(TAG, "TIEMPO ENVIO: %lld PARA %lu BYTES", t1f - t10, nodo.cabecera.size);// BORRAR
@@ -474,6 +499,7 @@ void receive_thread(void* args) {
         if (recibir_cabecera(&c)) {
             xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
             xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
+            ESP_LOGE(TAG, "receive_thread: error recibiendo cabecera entrando en modo reconexion...");
             continue;
         }
         void* body = malloc(c.size);
@@ -485,6 +511,7 @@ void receive_thread(void* args) {
             free(body);
             xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
             xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
+            ESP_LOGE(TAG, "receive_thread: error recibiendo body entrando en modo reconexion...");
             continue;
         }
         tNodo n = {
@@ -499,8 +526,13 @@ void receive_thread(void* args) {
 
 void connection_thread(void* args) {
     while (1) {
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_DESCONEXION, pdTRUE, pdTRUE, portMAX_DELAY);
-        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // espera WiFi TODO: poner delante? se debe de estar primero conectado al
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // espera wifi
+        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_DESCONEXION, pdTRUE, pdTRUE, portMAX_DELAY); // espera socket desconectado
+        // ALERTA: proteger el soccket aqui?
+        if (server_socket >= 0) {
+            xQueueReset(send_queue);
+            xQueueReset(receive_queue);
+        }
         while (init_sockets()) {
             vTaskDelay(pdMS_TO_TICKS(3000)); // TODO: quizas esta sincrinizacion con la aceptacion del socket esta rota
         }
@@ -574,7 +606,10 @@ int recibir_cabecera(tCabecera* c) {
     void* cabecera = malloc(sizeof(tCabecera));
 
     while (total < sizeof(tCabecera)) {
-        ssize_t r = recv(server_socket, (char*)cabecera + total, sizeof(tCabecera) - total, 0); // hacemos un parse a char para sumar correctamente los bytes
+        xSemaphoreTake(server_socket_m, portMAX_DELAY);
+        int server_socket_protegido = server_socket;
+        xSemaphoreGive(server_socket_m);
+        ssize_t r = recv(server_socket_protegido, (char*)cabecera + total, sizeof(tCabecera) - total, 0); // hacemos un parse a char para sumar correctamente los bytes
         if (r > 0) {
             total += r;
         }
@@ -602,7 +637,10 @@ int recibir_cabecera(tCabecera* c) {
 int recibir_body(uint32_t size, void* body) {
     uint32_t total = 0;
     while (total < size) {
-        ssize_t r = recv(server_socket, (char*)body + total, size - total, 0);
+        xSemaphoreTake(server_socket_m, portMAX_DELAY);
+        int server_socket_protegido = server_socket;
+        xSemaphoreGive(server_socket_m);
+        ssize_t r = recv(server_socket_protegido, (char*)body + total, size - total, 0);
         if (r > 0) {
             total += r;
         }
@@ -760,7 +798,10 @@ void timer_callback(void* arg) {
 int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body) {
     uint32_t total = 0;
     while (total < size_cabecera) {
-        ssize_t r = send(socket_servidor, ((char*) &n->cabecera) + total, size_cabecera - total, 0);
+        xSemaphoreTake(server_socket_m, portMAX_DELAY);
+        int socket_servidor_protegido = server_socket;
+        xSemaphoreGive(server_socket_m);
+        ssize_t r = send(socket_servidor_protegido, ((char*) &n->cabecera) + total, size_cabecera - total, 0);
         if (r > 0) {
             total += r;
         }

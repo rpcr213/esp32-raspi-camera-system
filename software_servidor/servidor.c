@@ -132,7 +132,8 @@ int main(void) {
         }
         if (existe) { // es una reconexion
             // TODO: meter pausa o algo, es una reconexion
-            sleep(3);
+            printf("Reconectando el dispositivo %s...\n", ip_cliente);
+            sleep(3); // ALERTA: realmente necesario
         }
 
 
@@ -153,33 +154,36 @@ int main(void) {
                 printf("Conexion establecida con: %s\n", dispositivo[i].ip_cliente);
                 cola_init(&dispositivo[i].cola_recieve);
                 cola_init(&dispositivo[i].cola_send);
-                int max = -1, idx = -1, encontrado = 0; // en principio no deberia de haber problemas con idx valiendo -1, siempre habra algun dispositivo que sea mas viejo que otro
-                for (int j = 0; j < MAX_HISTORIAL_DISPOSITIVOS; j++) {
-                    if (ip[j].tiempo == -1) {
-                        ip[j].tiempo = 0;
-                        ip[j].id = i; // le asignamos el dispositivo
-                        snprintf(ip[j].ip_addr, INET_ADDRSTRLEN, "%s", dispositivo[i].ip_cliente); // copiamos la ip al historial
-                        encontrado = 1;
-                        break;
-                    }
-                    else { // si entra aqui es que ya se asigno en algun momento un dispositivo
-                        if (dispositivo[ip[j].id].client_socket == -1) { // el dispositivo no esta conectado
-                            ip[j].tiempo++;
-                            if (max < ip[j].tiempo) {
-                                max = ip[j].tiempo;
-                                idx = j;
+                if (!existe) {
+                    int max = -1, idx = -1, encontrado = 0; // en principio no deberia de haber problemas con idx valiendo -1, siempre habra algun dispositivo que sea mas viejo que otro
+                    for (int j = 0; j < MAX_HISTORIAL_DISPOSITIVOS; j++) {
+                        if (ip[j].id == -1) {
+                            ip[j].tiempo = 0;
+                            ip[j].id = i; // le asignamos el dispositivo
+                            snprintf(ip[j].ip_addr, INET_ADDRSTRLEN, "%s", dispositivo[i].ip_cliente); // copiamos la ip al historial
+                            encontrado = 1;
+                            break;
+                        }
+                        else { // si entra aqui es que ya se asigno en algun momento un dispositivo
+                            if (dispositivo[ip[j].id].client_socket == -1) { // el dispositivo no esta conectado
+                                ip[j].tiempo++;
+                                if (max < ip[j].tiempo) {
+                                    max = ip[j].tiempo;
+                                    idx = j;
+                                }
                             }
                         }
                     }
-                }
-                if (!encontrado) {
-                    if (idx == -1) {
-                        printf("Error inesperado, todos los dispositivos son igual de viejos? Esta todo lleno?\n");
-                        return 1;
-                    }
-                    else {
-                        ip[idx].tiempo = 0;
-                        snprintf(ip[idx].ip_addr, IPV4_LEN, "%s", dispositivo[i].ip_cliente);
+                    if (!encontrado) {
+                        if (idx == -1) {
+                            printf("Error inesperado, todos los dispositivos son igual de viejos? Esta todo lleno?\n");
+                            return 1;
+                        }
+                        else {
+                            ip[idx].tiempo = 0;
+                            ip[idx].id = i;
+                            snprintf(ip[idx].ip_addr, IPV4_LEN, "%s", dispositivo[i].ip_cliente);
+                        }
                     }
                 }
                 char nombre_carpeta[MAX_NOMBRE_CARPETA];

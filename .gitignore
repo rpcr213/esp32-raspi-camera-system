@@ -5,6 +5,7 @@ managed_components/
 z_otros/
 .vscode/
 software_servidor/img/
+error_log/
 
 # archivos
 main/config.h
