@@ -25,7 +25,7 @@
 #define MAX_HISTORIAL_DISPOSITIVOS 30
 
 /*
-Servidor que maneja peticiones HTTP que se realizan desde una ESP32cam
+Servidor que maneja peticiones propias que se realizan desde una ESP32cam
 */
 
 // variables globales

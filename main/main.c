@@ -28,6 +28,12 @@
 
 
 // macros
+/* esta macro se encarga de notificar el error por la ESP y al servidor */
+#define INFORMAR_ERROR(texto) do { \
+    ESP_LOGE(TAG, texto); \
+    enviar_texto_servidor(texto); \
+} while(0)
+
 #define MAXIMUM_RETRY  5 // deshabilitado en el handler
 #define TIMER_TIME_PREDETERMINADO 30000000 // tiempo en us
 
@@ -121,7 +127,8 @@ void init_gpio(void);
 void wifi_init_sta(void);
 int init_sockets(void);
 void init_camera(void);
-void init_timer(void);
+int delete_timer(esp_timer_handle_t* p_timer);
+int create_timer(esp_timer_handle_t* p_timer, uint64_t time);
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 void execution_thread(void* args);
 void send_thread(void* args);
@@ -136,6 +143,7 @@ int enviar_texto_servidor(char* msj);
 void timer_callback(void* arg);
 void flash(camera_fb_t** fb);
 int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body);
+void informar_error(char* msj);
 
 
 void app_main(void) {
@@ -151,7 +159,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
     init_gpio();
     init_camera();
-    init_timer();
+    create_timer(&timer, TIMER_TIME_PREDETERMINADO);
     wifi_init_sta();
     xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION); // para conectar el socket
 
@@ -216,15 +224,6 @@ void app_main(void) {
     );
 
     while (1) {
-        /*
-        char msj[256];
-        snprintf(msj, 256, "ESP32-ESP32cam0: %d", num);
-        num++;
-        enviar_texto_servidor(msj);
-        // size_t heap_libre = esp_get_free_heap_size();
-        // ESP_LOGI(TAG, "Heap libre: %d bytes", heap_libre);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        */
         vTaskDelay(portMAX_DELAY);
     }
 }
@@ -501,7 +500,7 @@ void receive_thread(void* args) {
 void connection_thread(void* args) {
     while (1) {
         EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_DESCONEXION, pdTRUE, pdTRUE, portMAX_DELAY);
-        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // espera WiFi
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // espera WiFi TODO: poner delante? se debe de estar primero conectado al
         while (init_sockets()) {
             vTaskDelay(pdMS_TO_TICKS(3000)); // TODO: quizas esta sincrinizacion con la aceptacion del socket esta rota
         }
@@ -632,31 +631,30 @@ int command_execute(tComando c) {
                 enviar_texto_servidor("flash activado");
             }
             else {
-                enviar_texto_servidor("command_execute: parametro invalido para comando FLASH");
-                ESP_LOGE(TAG, "command_execute: parametro invalido para comando FLASH");
+                INFORMAR_ERROR("command_execute: parametro invalido para comando FLASH");
                 return 1;
             }
             break;
-        case FOTO:
+        case FOTO: // se asume que no hay parametro, se toma una foto
+            xTaskNotifyGive(capture_thread_handle);
+            /*            
             if (c.parametro >= 0) {
                 // TODO: quizas haya que cambiar mucha logica, osea hacer una especie de cola de eventos con tiempos que cuando lleguen a 0 se ejecuten esos eventos, no se si merece la pena
             }
             else {
-                enviar_texto_servidor("command_execute: parametro invalido para comando FOTO");
-                ESP_LOGE(TAG, "command_execute: parametro invalido para comando FOTO");
+                INFORMAR_ERROR("command_execute: parametro invalido para comando FOTO");
                 return 1;
             }
+            */
             break;
         case TIEMPO_FOTO:
-            if (c.parametro == 0) {
-                // TODO: hacer lo mismo que en FOTO ?
-            }
-            else if (c.parametro > 0) {
-                // TODO: ajustar tiempo a establecido (segundos)
+            if (c.parametro > 0) { 
+                // el c.parametro viene en segundos !!
+                delete_timer(&timer);
+                create_timer(&timer, ((uint64_t) c.parametro) * 1000000);
             }
             else {
-                enviar_texto_servidor("command_execute: parametro invalido para comando TIEMPO_FOTO");
-                ESP_LOGE(TAG, "command_execute: parametro invalido para comando TIEMPO_FOTO");
+                INFORMAR_ERROR("command_execute: parametro invalido para comando TIEMPO_FOTO");
                 return 1;
             }
             break;
@@ -728,15 +726,29 @@ void init_camera(void) {
     ESP_LOGI(TAG, "Camara inicializada correctamente");
 }
 
-void init_timer(void) {
+int delete_timer(esp_timer_handle_t* p_timer) {
+    esp_err_t ret;
+    ret = esp_timer_stop(*p_timer);
+    if (ret != ESP_OK) { // PENDIENTE
+        INFORMAR_ERROR("delete_timer: error al parar el timer");
+        return 1;
+    }
+    ret = esp_timer_delete(*p_timer);
+    *p_timer = NULL;
+    return 0;
+}
+
+int create_timer(esp_timer_handle_t* p_timer, uint64_t time) {
+    if (*p_timer != NULL) return 1;
     esp_timer_create_args_t timer_args = {
         .callback = timer_callback,
         .arg = NULL,
         .name = "timer"
     };
     
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer));
-    esp_timer_start_periodic(timer, TIMER_TIME_PREDETERMINADO);
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, p_timer));
+    esp_timer_start_periodic(*p_timer, time);
+    return 0;
 }
 
 

@@ -10,4 +10,6 @@ software_servidor/img/
 main/config.h
 software_servidor/comandos_relevantes.txt
 software_servidor/servidor_old.c
+software_servidor/servidor
 sdkconfig.old
+comandos_ssh.txt

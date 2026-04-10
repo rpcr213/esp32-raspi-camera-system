@@ -12,9 +12,9 @@ typedef enum {
 } tTipo;
 
 typedef enum {
-    FLASH,
-    FOTO,
-    TIEMPO_FOTO,
+    FLASH, // activa/desactiva el flash
+    FOTO, // toma una foto en ese momento
+    TIEMPO_FOTO, // modifica el tiempo entre foto y foto (osea el timer)
 } tTiposComandos;
 
 typedef struct {
