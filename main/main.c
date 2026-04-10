@@ -24,9 +24,23 @@
 
 #include "esp_camera.h"
 #include "config.h"
+#include "types.h"
 
+/*
+Buscar cosas por hacer: TODO
+Buscar cosas de las que no estoy seguro: ALERTA
+
+
+
+TOCTOU race
+*/
 
 // macros
+/* esta macro se encarga de notificar el error por la ESP y al servidor */
+#define INFORMAR_ERROR(texto) do { \
+    ESP_LOGE(TAG, texto); \
+    enviar_texto_servidor(texto); \
+} while(0)
 
 #define MAXIMUM_RETRY  5 // deshabilitado en el handler
 #define TIMER_TIME_PREDETERMINADO 30000000 // tiempo en us
@@ -92,48 +106,17 @@
 #define PCLK_GPIO_NUM     22
 
 
-
-
-
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
 #define FLASH_PIN 4
 #define HEARTBEAT_TIME 5
 #define TIMEOUT_TIME 15
+#define CHECK_CONNECTION_TIME 1000
 #define BIT_CONEXION BIT0
 #define BIT_DESCONEXION BIT1
 
-// tipos
-typedef enum {
-    PING,
-    PONG,
-    TEXTO,
-    IMAGEN,
-    COMANDO,
-} tTipo;
 
-typedef enum {
-    FLASH,
-    FOTO,
-    TIEMPO_FOTO,
-} tTiposComandos;
-
-typedef struct {
-    int dispositivo;
-    tTiposComandos comando;
-    int parametro;
-} tComando;
-
-typedef struct {
-    tTipo tipo; // tipo de mensaje: ping, texto, imagen...
-    uint32_t size; // tamanio del mensaje
-} tCabecera;
-
-typedef struct tNodo {
-    tCabecera cabecera;
-    void* body; // CRITICO: LIBERAR BODY AL EXTRAER 
-} tNodo; // para un comportamiento correcto, body debe de ser dinamico
 
 // variables globales
 const char* TAG = "firmwareESP32cam";
@@ -141,11 +124,12 @@ static EventGroupHandle_t s_wifi_event_group, connection_event_group_handle;
 static esp_netif_t* sta_netif = NULL;
 static int s_retry_num = 0;
 static int server_socket = -1;
-static int flash_time = 1000;
-static int flash_mode = 0; // TODO: race condition entre execute (escritura) y capture (lectura)
+static volatile int flash_time = 1000;
+static volatile int flash_mode = 0; // TODO: race condition entre execute (escritura) y capture (lectura)
 static TaskHandle_t heartbeat_ping_handle, execution_thread_handle, send_thread_handle, receive_thread_handle, connection_thread_handle, capture_thread_handle;
 static QueueHandle_t send_queue, receive_queue;
 static esp_timer_handle_t timer;
+static SemaphoreHandle_t server_socket_m;
 
 
 // cabeceras funciones
@@ -153,7 +137,8 @@ void init_gpio(void);
 void wifi_init_sta(void);
 int init_sockets(void);
 void init_camera(void);
-void init_timer(void);
+int delete_timer(esp_timer_handle_t* p_timer);
+int create_timer(esp_timer_handle_t* p_timer, uint64_t time);
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 void execution_thread(void* args);
 void send_thread(void* args);
@@ -168,9 +153,11 @@ int enviar_texto_servidor(char* msj);
 void timer_callback(void* arg);
 void flash(camera_fb_t** fb);
 int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body);
+void informar_error(char* msj);
 
 
 void app_main(void) {
+    server_socket_m = xSemaphoreCreateMutex();
     connection_event_group_handle = xEventGroupCreate();
     send_queue = xQueueCreate(10, sizeof(tNodo));
     receive_queue = xQueueCreate(10, sizeof(tNodo));
@@ -183,7 +170,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
     init_gpio();
     init_camera();
-    init_timer();
+    create_timer(&timer, TIMER_TIME_PREDETERMINADO);
     wifi_init_sta();
     xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION); // para conectar el socket
 
@@ -248,15 +235,6 @@ void app_main(void) {
     );
 
     while (1) {
-        /*
-        char msj[256];
-        snprintf(msj, 256, "ESP32-ESP32cam0: %d", num);
-        num++;
-        enviar_texto_servidor(msj);
-        // size_t heap_libre = esp_get_free_heap_size();
-        // ESP_LOGI(TAG, "Heap libre: %d bytes", heap_libre);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        */
         vTaskDelay(portMAX_DELAY);
     }
 }
@@ -275,14 +253,6 @@ void init_gpio(void) {
 }
 
 int init_sockets(void) {
-    if (server_socket >= 0) {
-        close(server_socket);
-    }
-    server_socket = socket(AF_INET, SOCK_STREAM, 0); // IPv4 + TPC
-    if (server_socket < 0) {
-        ESP_LOGE(TAG, "ERROR AL CREAT SOCKET: socket()");
-        return 1;
-    }
     struct sockaddr_in server_socket_addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = inet_addr(SERVER_IP),
@@ -292,19 +262,38 @@ int init_sockets(void) {
         .tv_sec = TIMEOUT_TIME, // segundos
         .tv_usec = 0 // microsegundos
     };
+
+
+    xSemaphoreTake(server_socket_m, portMAX_DELAY);
+    if (server_socket >= 0) {
+        close(server_socket);
+    }
+    server_socket = socket(AF_INET, SOCK_STREAM, 0); // IPv4 + TPC
+    if (server_socket < 0) {
+        xSemaphoreGive(server_socket_m);
+        ESP_LOGE(TAG, "ERROR AL CREAT SOCKET: socket()");
+        return 1;
+    }
     if (setsockopt(server_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) {
+        close(server_socket);
+        xSemaphoreGive(server_socket_m);
         ESP_LOGE(TAG, "init_sockets: setsockopt tv");
         return 1;
     } // introducimos un timeout de TIMEOUT_TIME
     int flag = 1;
     if (setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag))) {
+        close(server_socket);
+        xSemaphoreGive(server_socket_m);
         ESP_LOGE(TAG, "init_sockets: setsockopt nagle");
         return 1;
     } // desactivamos el algoritmo de nagle, hacia mas lento el envio de fotos
     if (connect(server_socket, (struct sockaddr*)&server_socket_addr, sizeof(server_socket_addr)) < 0) {
+        close(server_socket);
+        xSemaphoreGive(server_socket_m);
         ESP_LOGE(TAG, "ERROR AL CONECTAR SOCKET: connect()");
         return 1;
     }
+    xSemaphoreGive(server_socket_m);
     return 0;
 }
 
@@ -434,7 +423,7 @@ void execution_thread(void* args) {
     while (1) {
         EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
         tNodo nodo;
-        if (xQueueReceive(receive_queue, &nodo, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        if (xQueueReceive(receive_queue, &nodo, pdMS_TO_TICKS(CHECK_CONNECTION_TIME)) != pdTRUE) { // comprobamos cada segundo que seguimos teniendo conexion
             continue;
         }
         switch (nodo.cabecera.tipo) {
@@ -478,12 +467,15 @@ void send_thread(void* args) {
     while (1) {
         EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
         tNodo nodo;
-        xQueueReceive(send_queue, &nodo, portMAX_DELAY);
+        if (xQueueReceive(send_queue, &nodo, pdMS_TO_TICKS(CHECK_CONNECTION_TIME)) != pdTRUE) {
+            continue;
+        }
         int64_t t10 = esp_timer_get_time();// BORRAR
         if (enviar_nodo(server_socket, &nodo, sizeof(tCabecera), nodo.cabecera.size)) {
             xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
             xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
             ESP_LOGE(TAG, "send_thread: error de conexion, descartando nodo");
+            continue;
         }
         int64_t t1f = esp_timer_get_time();// BORRAR
         ESP_LOGI(TAG, "TIEMPO ENVIO: %lld PARA %lu BYTES", t1f - t10, nodo.cabecera.size);// BORRAR
@@ -507,6 +499,7 @@ void receive_thread(void* args) {
         if (recibir_cabecera(&c)) {
             xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
             xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
+            ESP_LOGE(TAG, "receive_thread: error recibiendo cabecera entrando en modo reconexion...");
             continue;
         }
         void* body = malloc(c.size);
@@ -518,6 +511,7 @@ void receive_thread(void* args) {
             free(body);
             xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
             xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
+            ESP_LOGE(TAG, "receive_thread: error recibiendo body entrando en modo reconexion...");
             continue;
         }
         tNodo n = {
@@ -532,12 +526,16 @@ void receive_thread(void* args) {
 
 void connection_thread(void* args) {
     while (1) {
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_DESCONEXION, pdTRUE, pdTRUE, portMAX_DELAY);
-        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // espera WiFi
-        while (init_sockets()) {
-            vTaskDelay(pdMS_TO_TICKS(500));
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // espera wifi
+        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_DESCONEXION, pdTRUE, pdTRUE, portMAX_DELAY); // espera socket desconectado
+        // ALERTA: proteger el soccket aqui?
+        if (server_socket >= 0) {
+            xQueueReset(send_queue);
+            xQueueReset(receive_queue);
         }
-        // vTaskDelay(pdMS_TO_TICKS(1000));
+        while (init_sockets()) {
+            vTaskDelay(pdMS_TO_TICKS(3000)); // TODO: quizas esta sincrinizacion con la aceptacion del socket esta rota
+        }
         xEventGroupSetBits(connection_event_group_handle, BIT_CONEXION);
     }
 }
@@ -608,7 +606,10 @@ int recibir_cabecera(tCabecera* c) {
     void* cabecera = malloc(sizeof(tCabecera));
 
     while (total < sizeof(tCabecera)) {
-        ssize_t r = recv(server_socket, (char*)cabecera + total, sizeof(tCabecera) - total, 0); // hacemos un parse a char para sumar correctamente los bytes
+        xSemaphoreTake(server_socket_m, portMAX_DELAY);
+        int server_socket_protegido = server_socket;
+        xSemaphoreGive(server_socket_m);
+        ssize_t r = recv(server_socket_protegido, (char*)cabecera + total, sizeof(tCabecera) - total, 0); // hacemos un parse a char para sumar correctamente los bytes
         if (r > 0) {
             total += r;
         }
@@ -636,7 +637,10 @@ int recibir_cabecera(tCabecera* c) {
 int recibir_body(uint32_t size, void* body) {
     uint32_t total = 0;
     while (total < size) {
-        ssize_t r = recv(server_socket, (char*)body + total, size - total, 0);
+        xSemaphoreTake(server_socket_m, portMAX_DELAY);
+        int server_socket_protegido = server_socket;
+        xSemaphoreGive(server_socket_m);
+        ssize_t r = recv(server_socket_protegido, (char*)body + total, size - total, 0);
         if (r > 0) {
             total += r;
         }
@@ -665,31 +669,30 @@ int command_execute(tComando c) {
                 enviar_texto_servidor("flash activado");
             }
             else {
-                enviar_texto_servidor("command_execute: parametro invalido para comando FLASH");
-                ESP_LOGE(TAG, "command_execute: parametro invalido para comando FLASH");
+                INFORMAR_ERROR("command_execute: parametro invalido para comando FLASH");
                 return 1;
             }
             break;
-        case FOTO:
+        case FOTO: // se asume que no hay parametro, se toma una foto
+            xTaskNotifyGive(capture_thread_handle);
+            /*            
             if (c.parametro >= 0) {
                 // TODO: quizas haya que cambiar mucha logica, osea hacer una especie de cola de eventos con tiempos que cuando lleguen a 0 se ejecuten esos eventos, no se si merece la pena
             }
             else {
-                enviar_texto_servidor("command_execute: parametro invalido para comando FOTO");
-                ESP_LOGE(TAG, "command_execute: parametro invalido para comando FOTO");
+                INFORMAR_ERROR("command_execute: parametro invalido para comando FOTO");
                 return 1;
             }
+            */
             break;
         case TIEMPO_FOTO:
-            if (c.parametro == 0) {
-                // TODO: hacer lo mismo que en FOTO ?
-            }
-            else if (c.parametro > 0) {
-                // TODO: ajustar tiempo a establecido (segundos)
+            if (c.parametro > 0) { 
+                // el c.parametro viene en segundos !!
+                delete_timer(&timer);
+                create_timer(&timer, ((uint64_t) c.parametro) * 1000000);
             }
             else {
-                enviar_texto_servidor("command_execute: parametro invalido para comando TIEMPO_FOTO");
-                ESP_LOGE(TAG, "command_execute: parametro invalido para comando TIEMPO_FOTO");
+                INFORMAR_ERROR("command_execute: parametro invalido para comando TIEMPO_FOTO");
                 return 1;
             }
             break;
@@ -761,15 +764,29 @@ void init_camera(void) {
     ESP_LOGI(TAG, "Camara inicializada correctamente");
 }
 
-void init_timer(void) {
+int delete_timer(esp_timer_handle_t* p_timer) {
+    esp_err_t ret;
+    ret = esp_timer_stop(*p_timer);
+    if (ret != ESP_OK) { // PENDIENTE
+        INFORMAR_ERROR("delete_timer: error al parar el timer");
+        return 1;
+    }
+    ret = esp_timer_delete(*p_timer);
+    *p_timer = NULL;
+    return 0;
+}
+
+int create_timer(esp_timer_handle_t* p_timer, uint64_t time) {
+    if (*p_timer != NULL) return 1;
     esp_timer_create_args_t timer_args = {
         .callback = timer_callback,
         .arg = NULL,
         .name = "timer"
     };
     
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer));
-    esp_timer_start_periodic(timer, TIMER_TIME_PREDETERMINADO);
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, p_timer));
+    esp_timer_start_periodic(*p_timer, time);
+    return 0;
 }
 
 
@@ -781,7 +798,10 @@ void timer_callback(void* arg) {
 int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body) {
     uint32_t total = 0;
     while (total < size_cabecera) {
-        ssize_t r = send(socket_servidor, ((char*) &n->cabecera) + total, size_cabecera - total, 0);
+        xSemaphoreTake(server_socket_m, portMAX_DELAY);
+        int socket_servidor_protegido = server_socket;
+        xSemaphoreGive(server_socket_m);
+        ssize_t r = send(socket_servidor_protegido, ((char*) &n->cabecera) + total, size_cabecera - total, 0);
         if (r > 0) {
             total += r;
         }
