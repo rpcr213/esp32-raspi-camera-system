@@ -25,6 +25,7 @@
 #include "esp_camera.h"
 #include "config.h"
 #include "types.h"
+#include "camera.h"
 
 /*
 Buscar cosas por hacer: TODO
@@ -86,30 +87,9 @@ TOCTOU race
     #define EXAMPLE_H2E_IDENTIFIER ""
 #endif
 
-// macros camara
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
-
-
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define FLASH_PIN 4
 #define HEARTBEAT_TIME 5
 #define TIMEOUT_TIME 15
 #define CHECK_CONNECTION_TIME 1000
@@ -119,13 +99,11 @@ TOCTOU race
 
 
 // variables globales
-const char* TAG = "firmwareESP32cam";
+static const char* TAG = "MAIN";
 static EventGroupHandle_t s_wifi_event_group, connection_event_group_handle;
 static esp_netif_t* sta_netif = NULL;
 static int s_retry_num = 0;
 static int server_socket = -1;
-static volatile int flash_time = 1000;
-static volatile int flash_mode = 0; // TODO: race condition entre execute (escritura) y capture (lectura)
 static TaskHandle_t heartbeat_ping_handle, execution_thread_handle, send_thread_handle, receive_thread_handle, connection_thread_handle, capture_thread_handle;
 static QueueHandle_t send_queue, receive_queue;
 static esp_timer_handle_t timer;
@@ -136,7 +114,6 @@ static SemaphoreHandle_t server_socket_m;
 void init_gpio(void);
 void wifi_init_sta(void);
 int init_sockets(void);
-void init_camera(void);
 int delete_timer(esp_timer_handle_t* p_timer);
 int create_timer(esp_timer_handle_t* p_timer, uint64_t time);
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
@@ -169,7 +146,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
     init_gpio();
-    init_camera();
+    if (init_camera() != CAMERA_OK) esp_restart();
     create_timer(&timer, TIMER_TIME_PREDETERMINADO);
     wifi_init_sta();
     xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION); // para conectar el socket
@@ -548,14 +525,8 @@ void capture_thread(void* args) {
         // xTaskNotifyStateClear(NULL); // descartamos las notificaciones que no ha dado tiempo a procesar
         camera_fb_t* fb = NULL;
         // int64_t t10 = esp_timer_get_time();
-        if (flash_mode == 1) {
-            flash(&fb);
-        }
-        else {
-            fb = esp_camera_fb_get();
-        }
-        if (!fb) {
-            ESP_LOGE(TAG, "Error al capturar la imagen");
+        if (capture_photo(&fb) != CAMERA_OK) {
+            INFORMAR_ERROR("Error al capturar la imagen");
             continue;
         }
         // int64_t t1f = esp_timer_get_time();
@@ -564,7 +535,7 @@ void capture_thread(void* args) {
         uint8_t* img = (uint8_t*) heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM);
         if (img == NULL) {
             esp_camera_fb_return(fb);
-            ESP_LOGE(TAG, "Error al reservar psram para guardar la imagen");
+            INFORMAR_ERROR("capture_thread: error al reservar psram para enviar imagen");
             continue;
         }
         memcpy(img, fb->buf, fb->len);
@@ -579,25 +550,13 @@ void capture_thread(void* args) {
             .body = (void*) img,
         };
 
-        xQueueSend(send_queue, &n, portMAX_DELAY);
+        if (xQueueSend(send_queue, &n, portMAX_DELAY) != pdTRUE) {
+            INFORMAR_ERROR("capture_thread: error al enviar la imagen por send_queue");
+            free(img);
+        }
 
         esp_camera_fb_return(fb); // marcamos el espacio capturado como libre (podemos sobreescribirlo)
     }
-}
-
-//
-void flash(camera_fb_t** fb) {
-    gpio_set_level(FLASH_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(flash_time / 2));
-    for (int i = 0; i < 4; i++) {
-        *fb = esp_camera_fb_get();
-        if (*fb == NULL) continue;
-        esp_camera_fb_return(*fb);
-        *fb = NULL;
-    }
-    *fb = esp_camera_fb_get();
-    vTaskDelay(pdMS_TO_TICKS(flash_time / 2));
-    gpio_set_level(FLASH_PIN, 0);
 }
 
 // TODO: malloc innecesario
@@ -660,18 +619,13 @@ int recibir_body(uint32_t size, void* body) {
 int command_execute(tComando c) {
     switch (c.comando) {
         case FLASH:
-            if (c.parametro == 0) {
-                flash_mode = 0;
-                enviar_texto_servidor("flash desactivado");
-            }
-            else if (c.parametro == 1) {
-                flash_mode = 1;
-                enviar_texto_servidor("flash activado");
-            }
-            else {
+            if (change_flash_mode(c.parametro) != CAMERA_OK) {
                 INFORMAR_ERROR("command_execute: parametro invalido para comando FLASH");
                 return 1;
             }
+            char msj[32];
+            snprintf(msj, sizeof(msj), "flash %s", ((get_flash_mode() == 0) ? "desactivado" : "activado"));
+            enviar_texto_servidor(msj);
             break;
         case FOTO: // se asume que no hay parametro, se toma una foto
             xTaskNotifyGive(capture_thread_handle);
@@ -721,47 +675,11 @@ int enviar_texto_servidor(char* msj) {
         return 1;
     }
     memcpy(n.body, msj, len);
-    xQueueSend(send_queue, &n, portMAX_DELAY);
-    return 0;
-}
-
-void init_camera(void) {
-    camera_config_t config = {
-        .ledc_channel = LEDC_CHANNEL_0,
-        .ledc_timer   = LEDC_TIMER_0,
-        .pin_d0       = Y2_GPIO_NUM,
-        .pin_d1       = Y3_GPIO_NUM,
-        .pin_d2       = Y4_GPIO_NUM,
-        .pin_d3       = Y5_GPIO_NUM,
-        .pin_d4       = Y6_GPIO_NUM,
-        .pin_d5       = Y7_GPIO_NUM,
-        .pin_d6       = Y8_GPIO_NUM,
-        .pin_d7       = Y9_GPIO_NUM,
-        .pin_xclk     = XCLK_GPIO_NUM,
-        .pin_pclk     = PCLK_GPIO_NUM,
-        .pin_vsync    = VSYNC_GPIO_NUM,
-        .pin_href     = HREF_GPIO_NUM,
-        .pin_sccb_sda = SIOD_GPIO_NUM,
-        .pin_sccb_scl = SIOC_GPIO_NUM,
-        .pin_pwdn     = PWDN_GPIO_NUM, // para apagar la camara??
-        .pin_reset    = RESET_GPIO_NUM,
-        .xclk_freq_hz = 20000000, // frecuencia del sensor
-        .pixel_format = PIXFORMAT_JPEG, // tipo de foto
-        .frame_size   = FRAMESIZE_UXGA, // resolucion (mas mejor)
-        .jpeg_quality = 12, // grado de compresion (menos mejor)
-        .fb_count     = 1, // cuantos buffers, osea imagenes podemos almacenar simultaneamente
-        .fb_location  = CAMERA_FB_IN_PSRAM, // guardamos las imagenes en la psram (importante tenerlo activado desde menuconfig)
-        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY // guardar cuando esta vacio el buffer
-    };
-
-    ESP_LOGI(TAG, "Inicializando camara");
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error iniciando camara: 0x%x", err);
-        return;
+    if (xQueueSend(send_queue, &n, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "enviar_texto_servidor: error al enviar por send_queue");
+        return 1;
     }
-
-    ESP_LOGI(TAG, "Camara inicializada correctamente");
+    return 0;
 }
 
 int delete_timer(esp_timer_handle_t* p_timer) {

@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "main.c" "camera.c"
                     INCLUDE_DIRS "."
                     REQUIRES esp32-camera
                     PRIV_REQUIRES
