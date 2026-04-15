@@ -604,11 +604,11 @@ void flash(camera_fb_t** fb) {
 int recibir_cabecera(tCabecera* c) {
     int total = 0;
     void* cabecera = malloc(sizeof(tCabecera));
+    xSemaphoreTake(server_socket_m, portMAX_DELAY);
+    int server_socket_protegido = server_socket;
+    xSemaphoreGive(server_socket_m);
 
     while (total < sizeof(tCabecera)) {
-        xSemaphoreTake(server_socket_m, portMAX_DELAY);
-        int server_socket_protegido = server_socket;
-        xSemaphoreGive(server_socket_m);
         ssize_t r = recv(server_socket_protegido, (char*)cabecera + total, sizeof(tCabecera) - total, 0); // hacemos un parse a char para sumar correctamente los bytes
         if (r > 0) {
             total += r;
@@ -636,10 +636,10 @@ int recibir_cabecera(tCabecera* c) {
 
 int recibir_body(uint32_t size, void* body) {
     uint32_t total = 0;
+    xSemaphoreTake(server_socket_m, portMAX_DELAY);
+    int server_socket_protegido = server_socket;
+    xSemaphoreGive(server_socket_m);
     while (total < size) {
-        xSemaphoreTake(server_socket_m, portMAX_DELAY);
-        int server_socket_protegido = server_socket;
-        xSemaphoreGive(server_socket_m);
         ssize_t r = recv(server_socket_protegido, (char*)body + total, size - total, 0);
         if (r > 0) {
             total += r;
@@ -797,10 +797,10 @@ void timer_callback(void* arg) {
 
 int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body) {
     uint32_t total = 0;
+    xSemaphoreTake(server_socket_m, portMAX_DELAY);
+    int socket_servidor_protegido = server_socket;
+    xSemaphoreGive(server_socket_m);
     while (total < size_cabecera) {
-        xSemaphoreTake(server_socket_m, portMAX_DELAY);
-        int socket_servidor_protegido = server_socket;
-        xSemaphoreGive(server_socket_m);
         ssize_t r = send(socket_servidor_protegido, ((char*) &n->cabecera) + total, size_cabecera - total, 0);
         if (r > 0) {
             total += r;
@@ -817,7 +817,7 @@ int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body)
     total = 0;
     int num_envios = 0;// BORRAR
     while (total < size_body) {
-        ssize_t r = send(socket_servidor, ((char*) n->body) + total, size_body - total, 0);
+        ssize_t r = send(socket_servidor_protegido, ((char*) n->body) + total, size_body - total, 0);
         if (r > 0) {
             total += r;
         }
