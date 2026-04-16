@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "camera.c" "wifi.c"
+idf_component_register(SRCS "network.c" "network_manager.c" "main.c" "camera.c" "wifi.c" "network.c"
                     INCLUDE_DIRS "."
                     REQUIRES esp32-camera
                     PRIV_REQUIRES

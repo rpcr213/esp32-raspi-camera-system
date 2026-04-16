@@ -27,6 +27,7 @@
 #include "types.h"
 #include "camera.h"
 #include "wifi.h"
+#include "network.h"
 
 /*
 Buscar cosas por hacer: TODO
@@ -48,26 +49,19 @@ TOCTOU race
 
 
 #define HEARTBEAT_TIME 5
-#define TIMEOUT_TIME 15
 #define CHECK_CONNECTION_TIME 1000
-#define BIT_CONEXION BIT0
-#define BIT_DESCONEXION BIT1
 
 
 
 // variables globales
 static const char* TAG = "MAIN";
-static EventGroupHandle_t connection_event_group_handle;
-static int server_socket = -1;
 static TaskHandle_t heartbeat_ping_handle, execution_thread_handle, send_thread_handle, receive_thread_handle, connection_thread_handle, capture_thread_handle;
 static QueueHandle_t send_queue, receive_queue;
 static esp_timer_handle_t timer;
-static SemaphoreHandle_t server_socket_m;
 
 
 // cabeceras funciones
 void init_gpio(void);
-int init_sockets(void);
 int delete_timer(esp_timer_handle_t* p_timer);
 int create_timer(esp_timer_handle_t* p_timer, uint64_t time);
 void execution_thread(void* args);
@@ -76,18 +70,15 @@ void heartbeat_ping(void* args);
 void receive_thread(void* args); // TODO: limpiar basura que quedo en colas y cosas asi cuando se reconecta, para todos los threads que se paren mientras se reconecta
 void connection_thread(void* args);
 void capture_thread(void* args);
-int recibir_cabecera(tCabecera* c);
-int recibir_body(uint32_t size, void* body);
 int command_execute(tComando c);
-int enviar_texto_servidor(char* msj);
 void timer_callback(void* arg);
 void flash(camera_fb_t** fb);
-int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body);
+int enviar_texto_servidor(char* msj);
 
 
 void app_main(void) {
-    server_socket_m = xSemaphoreCreateMutex();
-    connection_event_group_handle = xEventGroupCreate();
+    init_network_mutex();
+    init_network_event_group();
     send_queue = xQueueCreate(10, sizeof(tNodo));
     receive_queue = xQueueCreate(10, sizeof(tNodo));
     int num = 0;
@@ -101,7 +92,7 @@ void app_main(void) {
     if (init_camera() != CAMERA_OK) esp_restart();
     create_timer(&timer, TIMER_TIME_PREDETERMINADO);
     wifi_init_sta();
-    xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION); // para conectar el socket
+    set_event(BIT_DESCONEXION);
 
     xTaskCreatePinnedToCore (
         connection_thread,            // función de la tarea
@@ -181,51 +172,6 @@ void init_gpio(void) {
     gpio_config(&config);
 }
 
-int init_sockets(void) {
-    struct sockaddr_in server_socket_addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = inet_addr(SERVER_IP),
-        .sin_port = htons(SERVER_PORT),
-    };
-    struct timeval tv = {
-        .tv_sec = TIMEOUT_TIME, // segundos
-        .tv_usec = 0 // microsegundos
-    };
-
-
-    xSemaphoreTake(server_socket_m, portMAX_DELAY);
-    if (server_socket >= 0) {
-        close(server_socket);
-    }
-    server_socket = socket(AF_INET, SOCK_STREAM, 0); // IPv4 + TPC
-    if (server_socket < 0) {
-        xSemaphoreGive(server_socket_m);
-        ESP_LOGE(TAG, "ERROR AL CREAT SOCKET: socket()");
-        return 1;
-    }
-    if (setsockopt(server_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) {
-        close(server_socket);
-        xSemaphoreGive(server_socket_m);
-        ESP_LOGE(TAG, "init_sockets: setsockopt tv");
-        return 1;
-    } // introducimos un timeout de TIMEOUT_TIME
-    int flag = 1;
-    if (setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag))) {
-        close(server_socket);
-        xSemaphoreGive(server_socket_m);
-        ESP_LOGE(TAG, "init_sockets: setsockopt nagle");
-        return 1;
-    } // desactivamos el algoritmo de nagle, hacia mas lento el envio de fotos
-    if (connect(server_socket, (struct sockaddr*)&server_socket_addr, sizeof(server_socket_addr)) < 0) {
-        close(server_socket);
-        xSemaphoreGive(server_socket_m);
-        ESP_LOGE(TAG, "ERROR AL CONECTAR SOCKET: connect()");
-        return 1;
-    }
-    xSemaphoreGive(server_socket_m);
-    return 0;
-}
-
 // hilo que ejecuta el heartbeat
 void heartbeat_ping(void* args) {
     tCabecera cabecera_ping = {
@@ -234,7 +180,7 @@ void heartbeat_ping(void* args) {
     };
 
     while (1) {
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
+        EventBits_t bits = wait_event(BIT_CONEXION);
         char* ping = malloc(5);
         if (ping == NULL) { // TODO: quizas empiece como loco a ejecutarse porque no hay delays
             ESP_LOGE(TAG, "heartbeat_ping: error malloc");
@@ -258,7 +204,7 @@ void execution_thread(void* args) {
         .size = 5,
     };
     while (1) {
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
+        EventBits_t bits = wait_event(BIT_CONEXION);
         tNodo nodo;
         if (xQueueReceive(receive_queue, &nodo, pdMS_TO_TICKS(CHECK_CONNECTION_TIME)) != pdTRUE) { // comprobamos cada segundo que seguimos teniendo conexion
             continue;
@@ -302,15 +248,15 @@ void execution_thread(void* args) {
 
 void send_thread(void* args) {
     while (1) {
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
+        EventBits_t bits = wait_event(BIT_CONEXION);
         tNodo nodo;
         if (xQueueReceive(send_queue, &nodo, pdMS_TO_TICKS(CHECK_CONNECTION_TIME)) != pdTRUE) {
             continue;
         }
         int64_t t10 = esp_timer_get_time();// BORRAR
-        if (enviar_nodo(server_socket, &nodo, sizeof(tCabecera), nodo.cabecera.size)) {
-            xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
-            xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
+        if (enviar_nodo(&nodo, sizeof(tCabecera), nodo.cabecera.size)) {
+            clear_event(BIT_CONEXION);
+            set_event(BIT_DESCONEXION);
             ESP_LOGE(TAG, "send_thread: error de conexion, descartando nodo");
             continue;
         }
@@ -331,11 +277,11 @@ void send_thread(void* args) {
 
 void receive_thread(void* args) {
     while (1) {
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
+        EventBits_t bits = wait_event(BIT_CONEXION);
         tCabecera c;
         if (recibir_cabecera(&c)) {
-            xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
-            xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
+            clear_event(BIT_CONEXION);
+            set_event(BIT_DESCONEXION);
             ESP_LOGE(TAG, "receive_thread: error recibiendo cabecera entrando en modo reconexion...");
             continue;
         }
@@ -346,8 +292,8 @@ void receive_thread(void* args) {
         }
         if (recibir_body(c.size, body)) {
             free(body);
-            xEventGroupClearBits(connection_event_group_handle, BIT_CONEXION);
-            xEventGroupSetBits(connection_event_group_handle, BIT_DESCONEXION);
+            clear_event(BIT_CONEXION);
+            set_event(BIT_DESCONEXION);
             ESP_LOGE(TAG, "receive_thread: error recibiendo body entrando en modo reconexion...");
             continue;
         }
@@ -364,23 +310,24 @@ void receive_thread(void* args) {
 void connection_thread(void* args) {
     while (1) {
         wait_wifi();
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_DESCONEXION, pdTRUE, pdTRUE, portMAX_DELAY); // espera socket desconectado
+        EventBits_t bits = wait_event(BIT_DESCONEXION);
+        clear_event(BIT_DESCONEXION);
         // ALERTA: proteger el soccket aqui?
-        if (server_socket >= 0) {
+        if (socket_is_active()) {
             xQueueReset(send_queue);
             xQueueReset(receive_queue);
         }
         while (init_sockets()) {
             vTaskDelay(pdMS_TO_TICKS(3000)); // TODO: quizas esta sincrinizacion con la aceptacion del socket esta rota
         }
-        xEventGroupSetBits(connection_event_group_handle, BIT_CONEXION);
+        set_event(BIT_CONEXION);
     }
 }
 
 
 void capture_thread(void* args) {
     while (1) {
-        EventBits_t bits = xEventGroupWaitBits(connection_event_group_handle, BIT_CONEXION, pdFALSE, pdTRUE, portMAX_DELAY);
+        EventBits_t bits = wait_event(BIT_CONEXION);
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         // xTaskNotifyStateClear(NULL); // descartamos las notificaciones que no ha dado tiempo a procesar
         camera_fb_t* fb = NULL;
@@ -417,62 +364,6 @@ void capture_thread(void* args) {
 
         esp_camera_fb_return(fb); // marcamos el espacio capturado como libre (podemos sobreescribirlo)
     }
-}
-
-// TODO: malloc innecesario
-int recibir_cabecera(tCabecera* c) {
-    int total = 0;
-    void* cabecera = malloc(sizeof(tCabecera));
-    xSemaphoreTake(server_socket_m, portMAX_DELAY);
-    int server_socket_protegido = server_socket;
-    xSemaphoreGive(server_socket_m);
-
-    while (total < sizeof(tCabecera)) {
-        ssize_t r = recv(server_socket_protegido, (char*)cabecera + total, sizeof(tCabecera) - total, 0); // hacemos un parse a char para sumar correctamente los bytes
-        if (r > 0) {
-            total += r;
-        }
-        else if (r == 0) {
-            ESP_LOGE(TAG, "recibir_cabecera: conexion interrumpida mientras se recibe la cabecera");
-            free(cabecera);
-            return 1;
-        }
-        else if (r == -1) {
-            ESP_LOGE(TAG, "recibir_cabecera: error de conexion mientras se recibe la cabecera\n");
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                ESP_LOGE(TAG, "TIEMPO DE RESPUESTA AGOTADO");
-            }
-            free(cabecera);
-            return 1;
-        }
-    }
-
-    *c = *((tCabecera*) cabecera);
-    free(cabecera);
-    return 0;
-}
-
-
-int recibir_body(uint32_t size, void* body) {
-    uint32_t total = 0;
-    xSemaphoreTake(server_socket_m, portMAX_DELAY);
-    int server_socket_protegido = server_socket;
-    xSemaphoreGive(server_socket_m);
-    while (total < size) {
-        ssize_t r = recv(server_socket_protegido, (char*)body + total, size - total, 0);
-        if (r > 0) {
-            total += r;
-        }
-        else if (r == 0) {
-            printf("Conexion interrumpida mientras se recibe el body\n");
-            return 1;
-        }
-        else if (r == -1) {
-            printf("Error de conexion mientras se recibe el body\n");
-            return 1;
-        }
-    }
-    return 0;
 }
 
 
@@ -517,31 +408,6 @@ int command_execute(tComando c) {
     return 0;
 }
 
-int enviar_texto_servidor(char* msj) {
-    if (msj == NULL) {
-        ESP_LOGE(TAG, "enviar_texto_servidor: msj es NULL");
-        return 1;
-    }
-    int len = strlen(msj) + 1;
-    tNodo n = {
-        .cabecera = {
-            .tipo = TEXTO,
-            .size = len,
-        },
-        .body = malloc(len),
-    };
-    if (n.body == NULL) {
-        ESP_LOGE(TAG, "enviar_texto_servidor: error malloc");
-        return 1;
-    }
-    memcpy(n.body, msj, len);
-    if (xQueueSend(send_queue, &n, portMAX_DELAY) != pdTRUE) {
-        ESP_LOGE(TAG, "enviar_texto_servidor: error al enviar por send_queue");
-        return 1;
-    }
-    return 0;
-}
-
 int delete_timer(esp_timer_handle_t* p_timer) {
     esp_err_t ret;
     ret = esp_timer_stop(*p_timer);
@@ -573,45 +439,29 @@ void timer_callback(void* arg) {
 }
 
 
-int enviar_nodo(int socket_servidor, tNodo* n, int size_cabecera, int size_body) {
-    uint32_t total = 0;
-    xSemaphoreTake(server_socket_m, portMAX_DELAY);
-    int socket_servidor_protegido = server_socket;
-    xSemaphoreGive(server_socket_m);
-    while (total < size_cabecera) {
-        ssize_t r = send(socket_servidor_protegido, ((char*) &n->cabecera) + total, size_cabecera - total, 0);
-        if (r > 0) {
-            total += r;
-        }
-        else if (r == 0) {
-            ESP_LOGE(TAG, "Conexion interrumpida mientras se envia la cabecera");
-            return 1;
-        }
-        else if (r == -1) {
-            ESP_LOGE(TAG, "Error de conexion mientras se envia la cabecera\n");
-            return 1;
-        }
+
+int enviar_texto_servidor(char* msj) {
+    if (msj == NULL) {
+        ESP_LOGE(TAG, "enviar_texto_servidor: msj es NULL");
+        return 1;
     }
-    total = 0;
-    int num_envios = 0;// BORRAR
-    while (total < size_body) {
-        ssize_t r = send(socket_servidor_protegido, ((char*) n->body) + total, size_body - total, 0);
-        if (r > 0) {
-            total += r;
-        }
-        else if (r == 0) {
-            ESP_LOGE(TAG, "Conexion interrumpida mientras se envia el body\n");
-            return 1;
-        }
-        else if (r == -1) {
-            ESP_LOGE(TAG, "Error de conexion mientras se envia el body\n");
-            return 1;
-        }
-        num_envios++;// BORRAR
+    int len = strlen(msj) + 1;
+    tNodo n = {
+        .cabecera = {
+            .tipo = TEXTO,
+            .size = len,
+        },
+        .body = malloc(len),
+    };
+    if (n.body == NULL) {
+        ESP_LOGE(TAG, "enviar_texto_servidor: error malloc");
+        return 1;
     }
-    ESP_LOGI(TAG, "NUM ENVIOS: %d", num_envios);// BORRAR
+    memcpy(n.body, msj, len);
+    if (xQueueSend(send_queue, &n, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "enviar_texto_servidor: error al enviar por send_queue");
+        return 1;
+    }
     return 0;
 }
-
-
 
